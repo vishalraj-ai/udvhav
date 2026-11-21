@@ -1,0 +1,866 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Pillar 1: Global Default-Deny Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // ── Global Hardened Primitives ──────────────────────────────────────────
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isBootstrappedAdmin() {
+      return isVerified() && request.auth.token.email == 'vishalkebaba@gmail.com';
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidOptionalId(id) {
+      return id is string && id.size() <= 128 && (id == '' || id.matches('^[a-zA-Z0-9_\\-]+$'));
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function userProfileExists() {
+      return exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    function currentUserRole() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role;
+    }
+
+    function isAdmin() {
+      return isBootstrappedAdmin() || (isVerified() && userProfileExists() && currentUserRole() == 'admin');
+    }
+
+    function isOfficer() {
+      return isVerified() && userProfileExists() && currentUserRole() == 'officer';
+    }
+
+    function isInspector() {
+      return isVerified() && userProfileExists() && currentUserRole() == 'inspector';
+    }
+
+    function complaintExists(complaintId) {
+      return isValidId(complaintId) && exists(/databases/$(database)/documents/complaints/$(complaintId));
+    }
+
+    function isStringBounded(val, minLen, maxLen) {
+      return val is string && val.size() >= minLen && val.size() <= maxLen;
+    }
+
+    function isValidLanguage(lang) {
+      return lang in ['en', 'hi', 'ta', 'te', 'kn', 'mr', 'bn', 'gu'];
+    }
+
+    function isValidSeverity(sev) {
+      return sev in ['Critical', 'High', 'Medium', 'Low'];
+    }
+
+    function isValidStringList(arr, maxLen) {
+      return arr is list && arr.size() <= maxLen && (arr.size() == 0 || (arr[0] is string && arr[0].size() <= 300));
+    }
+
+    // ── Entity Validation Blueprints (Pillar 2: Anti-Update-Gap) ────────────
+
+    function isValidUser(data) {
+      return data.keys().hasAll(['uid', 'displayName', 'email', 'role', 'language', 'department', 'wardId', 'phone', 'onDuty', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'displayName', 'email', 'role', 'language', 'department', 'wardId', 'phone', 'onDuty', 'createdAt', 'updatedAt'])
+        && isValidId(data.uid)
+        && isStringBounded(data.displayName, 1, 120)
+        && isStringBounded(data.email, 3, 200)
+        && data.role in ['citizen', 'inspector', 'officer', 'admin']
+        && isValidLanguage(data.language)
+        && isStringBounded(data.department, 0, 100)
+        && isStringBounded(data.wardId, 0, 64)
+        && isStringBounded(data.phone, 0, 32)
+        && data.onDuty is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidComplaint(data) {
+      return data.keys().hasAll([
+          'complaintCode', 'citizenUid', 'citizenName', 'language', 'rawText', 'translatedText',
+          'landmark', 'latitude', 'longitude', 'roadName', 'wardId', 'wardName', 'officeId',
+          'officeName', 'primaryDepartment', 'severity', 'status', 'isEmergency', 'issueCount',
+          'evidenceCount', 'hasSuspiciousEvidence', 'assignedInspectorUid', 'assignedOfficerUid',
+          'backupOfficerUid', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'complaintCode', 'citizenUid', 'citizenName', 'language', 'rawText', 'translatedText',
+          'landmark', 'latitude', 'longitude', 'roadName', 'wardId', 'wardName', 'officeId',
+          'officeName', 'primaryDepartment', 'severity', 'status', 'isEmergency', 'issueCount',
+          'evidenceCount', 'hasSuspiciousEvidence', 'assignedInspectorUid', 'assignedOfficerUid',
+          'backupOfficerUid', 'createdAt', 'updatedAt'
+        ])
+        && isStringBounded(data.complaintCode, 4, 40)
+        && data.complaintCode.matches('^[A-Z0-9_\\-]+$')
+        && isValidId(data.citizenUid)
+        && isStringBounded(data.citizenName, 1, 120)
+        && isValidLanguage(data.language)
+        && isStringBounded(data.rawText, 5, 4000)
+        && isStringBounded(data.translatedText, 0, 4000)
+        && isStringBounded(data.landmark, 0, 300)
+        && data.latitude is number && data.latitude >= -90 && data.latitude <= 90
+        && data.longitude is number && data.longitude >= -180 && data.longitude <= 180
+        && isStringBounded(data.roadName, 0, 250)
+        && isStringBounded(data.wardId, 0, 64)
+        && isStringBounded(data.wardName, 0, 120)
+        && isValidOptionalId(data.officeId)
+        && isStringBounded(data.officeName, 0, 160)
+        && isStringBounded(data.primaryDepartment, 0, 120)
+        && isValidSeverity(data.severity)
+        && data.status in ['submitted', 'ai_analyzed', 'emergency_escalated', 'inspector_assigned', 'inspected_mfir', 'officer_approved', 'work_order_issued', 'resolved', 'closed', 'rejected']
+        && data.isEmergency is bool
+        && data.issueCount is int && data.issueCount >= 0 && data.issueCount <= 25
+        && data.evidenceCount is int && data.evidenceCount >= 0 && data.evidenceCount <= 10
+        && data.hasSuspiciousEvidence is bool
+        && isValidOptionalId(data.assignedInspectorUid)
+        && isValidOptionalId(data.assignedOfficerUid)
+        && isValidOptionalId(data.backupOfficerUid)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidTaxonomy(data) {
+      return data.keys().hasAll(['code', 'domain', 'category', 'subcategory', 'department', 'defaultSeverity', 'emergencyTrigger', 'slaHours', 'active', 'recordScope', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['code', 'domain', 'category', 'subcategory', 'department', 'defaultSeverity', 'emergencyTrigger', 'slaHours', 'active', 'recordScope', 'createdAt', 'updatedAt'])
+        && isStringBounded(data.code, 3, 32) && data.code.matches('^[A-Z0-9_\\-]+$')
+        && isStringBounded(data.domain, 2, 80)
+        && isStringBounded(data.category, 2, 100)
+        && isStringBounded(data.subcategory, 2, 120)
+        && isStringBounded(data.department, 2, 120)
+        && isValidSeverity(data.defaultSeverity)
+        && data.emergencyTrigger is bool
+        && data.slaHours is int && data.slaHours >= 1 && data.slaHours <= 720
+        && data.active is bool
+        && data.recordScope == 'municipal_reference'
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidClassifiedIssue(data) {
+      return data.keys().hasAll(['complaintId', 'citizenUid', 'assignedInspectorUid', 'assignedOfficerUid', 'canonicalCode', 'domain', 'category', 'subcategory', 'department', 'description', 'recommendedSeverity', 'confidence', 'createdAt'])
+        && data.keys().hasOnly(['complaintId', 'citizenUid', 'assignedInspectorUid', 'assignedOfficerUid', 'canonicalCode', 'domain', 'category', 'subcategory', 'department', 'description', 'recommendedSeverity', 'confidence', 'createdAt'])
+        && isValidId(data.complaintId)
+        && isValidId(data.citizenUid)
+        && isValidOptionalId(data.assignedInspectorUid)
+        && isValidOptionalId(data.assignedOfficerUid)
+        && isStringBounded(data.canonicalCode, 2, 40)
+        && isStringBounded(data.domain, 2, 80)
+        && isStringBounded(data.category, 2, 100)
+        && isStringBounded(data.subcategory, 2, 120)
+        && isStringBounded(data.department, 2, 120)
+        && isStringBounded(data.description, 2, 1000)
+        && isValidSeverity(data.recommendedSeverity)
+        && data.confidence is number && data.confidence >= 0 && data.confidence <= 1
+        && data.createdAt is timestamp;
+    }
+
+    function isValidAiAnalysis(data) {
+      return data.keys().hasAll(['complaintId', 'citizenUid', 'assignedInspectorUid', 'assignedOfficerUid', 'model', 'detectedLanguage', 'englishSummary', 'observations', 'recommendedSeverity', 'emergencyFlag', 'emergencyReason', 'imageObservations', 'suspiciousVisualFlags', 'advisoryDisclaimer', 'createdAt'])
+        && data.keys().hasOnly(['complaintId', 'citizenUid', 'assignedInspectorUid', 'assignedOfficerUid', 'model', 'detectedLanguage', 'englishSummary', 'observations', 'recommendedSeverity', 'emergencyFlag', 'emergencyReason', 'imageObservations', 'suspiciousVisualFlags', 'advisoryDisclaimer', 'createdAt'])
+        && isValidId(data.complaintId)
+        && isValidId(data.citizenUid)
+        && isValidOptionalId(data.assignedInspectorUid)
+        && isValidOptionalId(data.assignedOfficerUid)
+        && isStringBounded(data.model, 2, 80)
+        && isStringBounded(data.detectedLanguage, 2, 40)
+        && isStringBounded(data.englishSummary, 2, 2000)
+        && isStringBounded(data.observations, 0, 3000)
+        && isValidSeverity(data.recommendedSeverity)
+        && data.emergencyFlag is bool
+        && isStringBounded(data.emergencyReason, 0, 1000)
+        && isStringBounded(data.imageObservations, 0, 2000)
+        && isValidStringList(data.suspiciousVisualFlags, 15)
+        && isStringBounded(data.advisoryDisclaimer, 5, 400)
+        && data.createdAt is timestamp;
+    }
+
+    function isValidEvidence(data) {
+      return data.keys().hasAll(['complaintId', 'citizenUid', 'assignedInspectorUid', 'assignedOfficerUid', 'fileName', 'mimeType', 'fileSize', 'sha256', 'storageType', 'storageUrl', 'isDuplicate', 'duplicateOfEvidenceId', 'exifCamera', 'exifTimestamp', 'exifGpsLat', 'exifGpsLng', 'hasExifGps', 'gpsMismatchMeters', 'suspiciousFlag', 'suspiciousReasons', 'reviewStatus', 'aiVisualNote', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['complaintId', 'citizenUid', 'assignedInspectorUid', 'assignedOfficerUid', 'fileName', 'mimeType', 'fileSize', 'sha256', 'storageType', 'storageUrl', 'isDuplicate', 'duplicateOfEvidenceId', 'exifCamera', 'exifTimestamp', 'exifGpsLat', 'exifGpsLng', 'hasExifGps', 'gpsMismatchMeters', 'suspiciousFlag', 'suspiciousReasons', 'reviewStatus', 'aiVisualNote', 'createdAt', 'updatedAt'])
+        && isValidId(data.complaintId)
+        && isValidId(data.citizenUid)
+        && isValidOptionalId(data.assignedInspectorUid)
+        && isValidOptionalId(data.assignedOfficerUid)
+        && isStringBounded(data.fileName, 1, 200)
+        && isStringBounded(data.mimeType, 3, 80)
+        && data.fileSize is int && data.fileSize > 0 && data.fileSize <= 10485760
+        && isStringBounded(data.sha256, 64, 64) && data.sha256.matches('^[a-f0-9]{64}$')
+        && data.storageType in ['server_local', 'firebase_storage']
+        && isStringBounded(data.storageUrl, 1, 500)
+        && data.isDuplicate is bool
+        && isValidOptionalId(data.duplicateOfEvidenceId)
+        && isStringBounded(data.exifCamera, 0, 200)
+        && isStringBounded(data.exifTimestamp, 0, 80)
+        && data.exifGpsLat is number
+        && data.exifGpsLng is number
+        && data.hasExifGps is bool
+        && data.gpsMismatchMeters is number && data.gpsMismatchMeters >= 0
+        && data.suspiciousFlag is bool
+        && isValidStringList(data.suspiciousReasons, 15)
+        && data.reviewStatus in ['pending_review', 'verified_human', 'flagged_unverified']
+        && isStringBounded(data.aiVisualNote, 0, 1000)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidAccidentHotspot(data) {
+      return data.keys().hasAll(['recordCode', 'locationName', 'roadName', 'wardId', 'latitude', 'longitude', 'incidentCount', 'fatalities', 'injuries', 'sourceDataset', 'verifiedDate', 'recordScope', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['recordCode', 'locationName', 'roadName', 'wardId', 'latitude', 'longitude', 'incidentCount', 'fatalities', 'injuries', 'sourceDataset', 'verifiedDate', 'recordScope', 'createdAt', 'updatedAt'])
+        && isStringBounded(data.recordCode, 2, 40)
+        && isStringBounded(data.locationName, 2, 200)
+        && isStringBounded(data.roadName, 0, 200)
+        && isStringBounded(data.wardId, 0, 64)
+        && data.latitude is number && data.latitude >= -90 && data.latitude <= 90
+        && data.longitude is number && data.longitude >= -180 && data.longitude <= 180
+        && data.incidentCount is int && data.incidentCount >= 0
+        && data.fatalities is int && data.fatalities >= 0
+        && data.injuries is int && data.injuries >= 0
+        && isStringBounded(data.sourceDataset, 2, 200)
+        && isStringBounded(data.verifiedDate, 0, 40)
+        && data.recordScope == 'municipal_reference'
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidMunicipalOffice(data) {
+      return data.keys().hasAll(['officeCode', 'officeName', 'department', 'wardId', 'wardName', 'address', 'latitude', 'longitude', 'minLat', 'maxLat', 'minLng', 'maxLng', 'contactPhone', 'primaryOfficerUid', 'primaryOfficerName', 'backupOfficerUid', 'backupOfficerName', 'inspectorUid', 'inspectorName', 'recordScope', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['officeCode', 'officeName', 'department', 'wardId', 'wardName', 'address', 'latitude', 'longitude', 'minLat', 'maxLat', 'minLng', 'maxLng', 'contactPhone', 'primaryOfficerUid', 'primaryOfficerName', 'backupOfficerUid', 'backupOfficerName', 'inspectorUid', 'inspectorName', 'recordScope', 'createdAt', 'updatedAt'])
+        && isStringBounded(data.officeCode, 2, 40)
+        && isStringBounded(data.officeName, 2, 160)
+        && isStringBounded(data.department, 2, 120)
+        && isStringBounded(data.wardId, 1, 64)
+        && isStringBounded(data.wardName, 2, 120)
+        && isStringBounded(data.address, 0, 300)
+        && data.latitude is number && data.latitude >= -90 && data.latitude <= 90
+        && data.longitude is number && data.longitude >= -180 && data.longitude <= 180
+        && data.minLat is number && data.maxLat is number && data.minLng is number && data.maxLng is number
+        && isStringBounded(data.contactPhone, 0, 40)
+        && isValidOptionalId(data.primaryOfficerUid)
+        && isStringBounded(data.primaryOfficerName, 0, 120)
+        && isValidOptionalId(data.backupOfficerUid)
+        && isStringBounded(data.backupOfficerName, 0, 120)
+        && isValidOptionalId(data.inspectorUid)
+        && isStringBounded(data.inspectorName, 0, 120)
+        && data.recordScope == 'municipal_reference'
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidInspectorAssignment(data) {
+      return data.keys().hasAll(['complaintId', 'citizenUid', 'inspectorUid', 'inspectorName', 'assignedOfficerUid', 'assignedByUid', 'priority', 'status', 'dueAt', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['complaintId', 'citizenUid', 'inspectorUid', 'inspectorName', 'assignedOfficerUid', 'assignedByUid', 'priority', 'status', 'dueAt', 'createdAt', 'updatedAt'])
+        && isValidId(data.complaintId)
+        && isValidId(data.citizenUid)
+        && isValidOptionalId(data.inspectorUid)
+        && isStringBounded(data.inspectorName, 1, 120)
+        && isValidOptionalId(data.assignedOfficerUid)
+        && isValidId(data.assignedByUid)
+        && isValidSeverity(data.priority)
+        && data.status in ['assigned', 'in_progress', 'completed']
+        && isStringBounded(data.dueAt, 0, 64)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidInspectionReport(data) {
+      return data.keys().hasAll(['complaintId', 'assignmentId', 'citizenUid', 'inspectorUid', 'inspectorName', 'assignedOfficerUid', 'physicalVerification', 'siteNotes', 'evidenceReviewOutcome', 'finalPriority', 'recommendedDepartment', 'estimatedCostInr', 'requiresWorkOrder', 'status', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['complaintId', 'assignmentId', 'citizenUid', 'inspectorUid', 'inspectorName', 'assignedOfficerUid', 'physicalVerification', 'siteNotes', 'evidenceReviewOutcome', 'finalPriority', 'recommendedDepartment', 'estimatedCostInr', 'requiresWorkOrder', 'status', 'createdAt', 'updatedAt'])
+        && isValidId(data.complaintId)
+        && isValidOptionalId(data.assignmentId)
+        && isValidId(data.citizenUid)
+        && isValidId(data.inspectorUid)
+        && isStringBounded(data.inspectorName, 1, 120)
+        && isValidOptionalId(data.assignedOfficerUid)
+        && data.physicalVerification in ['verified_on_site', 'partially_verified', 'not_found', 'hazardous_confirmed']
+        && isStringBounded(data.siteNotes, 5, 4000)
+        && data.evidenceReviewOutcome in ['evidence_consistent', 'suspicious_needs_inquiry', 'no_photo_submitted']
+        && isValidSeverity(data.finalPriority)
+        && isStringBounded(data.recommendedDepartment, 2, 120)
+        && data.estimatedCostInr is number && data.estimatedCostInr >= 0
+        && data.requiresWorkOrder is bool
+        && data.status in ['submitted', 'approved', 'revision_requested']
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidEmergencyIncident(data) {
+      return data.keys().hasAll(['complaintId', 'citizenUid', 'title', 'severity', 'triggerSource', 'matchedRuleIds', 'assignedOfficerUid', 'backupOfficerUid', 'assignedInspectorUid', 'wardId', 'officeId', 'status', 'acknowledgementDeadline', 'acknowledgedAt', 'acknowledgedByUid', 'escalatedAt', 'call112GuidanceShown', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['complaintId', 'citizenUid', 'title', 'severity', 'triggerSource', 'matchedRuleIds', 'assignedOfficerUid', 'backupOfficerUid', 'assignedInspectorUid', 'wardId', 'officeId', 'status', 'acknowledgementDeadline', 'acknowledgedAt', 'acknowledgedByUid', 'escalatedAt', 'call112GuidanceShown', 'createdAt', 'updatedAt'])
+        && isValidId(data.complaintId)
+        && isValidId(data.citizenUid)
+        && isStringBounded(data.title, 3, 240)
+        && data.severity in ['Critical', 'High']
+        && data.triggerSource in ['deterministic_rule', 'gemini_ai', 'hybrid']
+        && isValidStringList(data.matchedRuleIds, 20)
+        && isValidOptionalId(data.assignedOfficerUid)
+        && isValidOptionalId(data.backupOfficerUid)
+        && isValidOptionalId(data.assignedInspectorUid)
+        && isStringBounded(data.wardId, 0, 64)
+        && isValidOptionalId(data.officeId)
+        && data.status in ['open', 'acknowledged', 'escalated_backup', 'resolved']
+        && isStringBounded(data.acknowledgementDeadline, 0, 64)
+        && isStringBounded(data.acknowledgedAt, 0, 64)
+        && isValidOptionalId(data.acknowledgedByUid)
+        && isStringBounded(data.escalatedAt, 0, 64)
+        && data.call112GuidanceShown is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidOfficerApproval(data) {
+      return data.keys().hasAll(['complaintId', 'reportId', 'citizenUid', 'officerUid', 'officerName', 'assignedInspectorUid', 'decision', 'remarks', 'assignedDepartment', 'createdAt'])
+        && data.keys().hasOnly(['complaintId', 'reportId', 'citizenUid', 'officerUid', 'officerName', 'assignedInspectorUid', 'decision', 'remarks', 'assignedDepartment', 'createdAt'])
+        && isValidId(data.complaintId)
+        && isValidOptionalId(data.reportId)
+        && isValidId(data.citizenUid)
+        && isValidId(data.officerUid)
+        && isStringBounded(data.officerName, 1, 120)
+        && isValidOptionalId(data.assignedInspectorUid)
+        && data.decision in ['approved', 'revision_requested', 'rejected', 'emergency_cleared']
+        && isStringBounded(data.remarks, 2, 2000)
+        && isStringBounded(data.assignedDepartment, 2, 120)
+        && data.createdAt is timestamp;
+    }
+
+    function isValidWorkOrder(data) {
+      return data.keys().hasAll(['workOrderCode', 'complaintId', 'citizenUid', 'officerUid', 'assignedInspectorUid', 'department', 'officeId', 'wardId', 'priority', 'scopeOfWork', 'contractorOrCrew', 'status', 'targetDate', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['workOrderCode', 'complaintId', 'citizenUid', 'officerUid', 'assignedInspectorUid', 'department', 'officeId', 'wardId', 'priority', 'scopeOfWork', 'contractorOrCrew', 'status', 'targetDate', 'createdAt', 'updatedAt'])
+        && isStringBounded(data.workOrderCode, 4, 40) && data.workOrderCode.matches('^[A-Z0-9_\\-]+$')
+        && isValidId(data.complaintId)
+        && isValidId(data.citizenUid)
+        && isValidId(data.officerUid)
+        && isValidOptionalId(data.assignedInspectorUid)
+        && isStringBounded(data.department, 2, 120)
+        && isValidOptionalId(data.officeId)
+        && isStringBounded(data.wardId, 0, 64)
+        && isValidSeverity(data.priority)
+        && isStringBounded(data.scopeOfWork, 5, 2000)
+        && isStringBounded(data.contractorOrCrew, 0, 200)
+        && data.status in ['issued', 'in_progress', 'completed', 'verified']
+        && isStringBounded(data.targetDate, 0, 40)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidResolutionRecord(data) {
+      return data.keys().hasAll(['complaintId', 'workOrderId', 'citizenUid', 'verifiedByOfficerUid', 'officerName', 'assignedInspectorUid', 'resolutionSummary', 'citizenNotified', 'resolvedAt', 'createdAt'])
+        && data.keys().hasOnly(['complaintId', 'workOrderId', 'citizenUid', 'verifiedByOfficerUid', 'officerName', 'assignedInspectorUid', 'resolutionSummary', 'citizenNotified', 'resolvedAt', 'createdAt'])
+        && isValidId(data.complaintId)
+        && isValidOptionalId(data.workOrderId)
+        && isValidId(data.citizenUid)
+        && isValidId(data.verifiedByOfficerUid)
+        && isStringBounded(data.officerName, 1, 120)
+        && isValidOptionalId(data.assignedInspectorUid)
+        && isStringBounded(data.resolutionSummary, 5, 2000)
+        && data.citizenNotified is bool
+        && isStringBounded(data.resolvedAt, 4, 64)
+        && data.createdAt is timestamp;
+    }
+
+    function isValidNotification(data) {
+      return data.keys().hasAll(['recipientUid', 'senderUid', 'complaintId', 'emergencyIncidentId', 'type', 'severity', 'title', 'message', 'read', 'requiresAck', 'acknowledgedAt', 'escalationDeadline', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['recipientUid', 'senderUid', 'complaintId', 'emergencyIncidentId', 'type', 'severity', 'title', 'message', 'read', 'requiresAck', 'acknowledgedAt', 'escalationDeadline', 'createdAt', 'updatedAt'])
+        && isValidId(data.recipientUid)
+        && isValidId(data.senderUid)
+        && isValidOptionalId(data.complaintId)
+        && isValidOptionalId(data.emergencyIncidentId)
+        && data.type in ['emergency_alert', 'assignment', 'mfir_submitted', 'officer_decision', 'work_order', 'resolution', 'system']
+        && isValidSeverity(data.severity)
+        && isStringBounded(data.title, 2, 180)
+        && isStringBounded(data.message, 2, 1000)
+        && data.read is bool
+        && data.requiresAck is bool
+        && isStringBounded(data.acknowledgedAt, 0, 64)
+        && isStringBounded(data.escalationDeadline, 0, 64)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidAuditLog(data) {
+      return data.keys().hasAll(['actorUid', 'actorRole', 'action', 'entityType', 'entityId', 'summary', 'createdAt'])
+        && data.keys().hasOnly(['actorUid', 'actorRole', 'action', 'entityType', 'entityId', 'summary', 'createdAt'])
+        && isValidId(data.actorUid)
+        && data.actorRole in ['citizen', 'inspector', 'officer', 'admin']
+        && isStringBounded(data.action, 2, 100)
+        && isStringBounded(data.entityType, 2, 64)
+        && isStringBounded(data.entityId, 1, 128)
+        && isStringBounded(data.summary, 2, 600)
+        && data.createdAt is timestamp;
+    }
+
+    function isValidEmergencyRule(data) {
+      return data.keys().hasAll(['ruleCode', 'name', 'keywords', 'taxonomyCodes', 'severity', 'ackWindowMinutes', 'active', 'recordScope', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ruleCode', 'name', 'keywords', 'taxonomyCodes', 'severity', 'ackWindowMinutes', 'active', 'recordScope', 'createdAt', 'updatedAt'])
+        && isStringBounded(data.ruleCode, 2, 40) && data.ruleCode.matches('^[A-Z0-9_\\-]+$')
+        && isStringBounded(data.name, 2, 160)
+        && isValidStringList(data.keywords, 30)
+        && isValidStringList(data.taxonomyCodes, 20)
+        && data.severity in ['Critical', 'High']
+        && data.ackWindowMinutes is int && data.ackWindowMinutes >= 1 && data.ackWindowMinutes <= 180
+        && data.active is bool
+        && data.recordScope == 'municipal_reference'
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // ── Collection Rules ────────────────────────────────────────────────────
+
+    // 1. users (PII Isolation + Strict Role Immutability)
+    match /users/{userId} {
+      allow get: if isVerified() && isValidId(userId) && (request.auth.uid == userId || isAdmin());
+      allow list: if isBootstrappedAdmin();
+      allow create: if isVerified() && isValidId(userId)
+        && isValidUser(incoming())
+        && userId == request.auth.uid
+        && incoming().uid == request.auth.uid
+        && incoming().email == request.auth.token.email
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && (incoming().role == 'citizen' || (isBootstrappedAdmin() && incoming().role == 'admin'));
+      allow update: if isVerified() && isValidId(userId)
+        && isValidUser(incoming())
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          (request.auth.uid == userId
+            && incoming().role == existing().role
+            && incoming().email == existing().email
+            && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'language', 'phone', 'onDuty', 'updatedAt']))
+          || (isAdmin()
+            && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'role', 'language', 'department', 'wardId', 'phone', 'onDuty', 'updatedAt']))
+        );
+      allow delete: if false;
+    }
+
+    // 2. complaints
+    match /complaints/{complaintId} {
+      allow get: if isVerified() && isValidId(complaintId) && (
+        existing().citizenUid == request.auth.uid
+        || existing().assignedInspectorUid == request.auth.uid
+        || existing().assignedOfficerUid == request.auth.uid
+        || existing().backupOfficerUid == request.auth.uid
+        || isAdmin()
+      );
+      allow list: if isVerified() && (
+        existing().citizenUid == request.auth.uid
+        || existing().assignedInspectorUid == request.auth.uid
+        || existing().assignedOfficerUid == request.auth.uid
+        || existing().backupOfficerUid == request.auth.uid
+        || isBootstrappedAdmin()
+      );
+      allow create: if isVerified() && isValidId(complaintId)
+        && isValidComplaint(incoming())
+        && incoming().citizenUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && incoming().status in ['submitted', 'ai_analyzed', 'emergency_escalated', 'inspector_assigned'];
+      allow update: if isVerified() && isValidId(complaintId)
+        && isValidComplaint(incoming())
+        && incoming().citizenUid == existing().citizenUid
+        && incoming().complaintCode == existing().complaintCode
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin()
+          || (existing().status != 'closed' && (
+            (isInspector() && existing().assignedInspectorUid == request.auth.uid
+              && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'severity', 'primaryDepartment', 'hasSuspiciousEvidence', 'updatedAt'])
+              && incoming().status in ['inspector_assigned', 'inspected_mfir'])
+            ||
+            (isOfficer() && (existing().assignedOfficerUid == request.auth.uid || existing().backupOfficerUid == request.auth.uid)
+              && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'severity', 'primaryDepartment', 'assignedInspectorUid', 'assignedOfficerUid', 'updatedAt']))
+          ))
+        );
+      allow delete: if false;
+    }
+
+    // 3. issue_taxonomy (Reference Data)
+    match /issue_taxonomy/{taxonomyId} {
+      allow get: if isVerified() && isValidId(taxonomyId) && existing().recordScope == 'municipal_reference';
+      allow list: if isVerified() && existing().recordScope == 'municipal_reference';
+      allow create: if isVerified() && isValidId(taxonomyId) && isValidTaxonomy(incoming()) && incoming().createdAt == request.time && incoming().updatedAt == request.time && isAdmin();
+      allow update: if isVerified() && isValidId(taxonomyId) && isValidTaxonomy(incoming()) && incoming().createdAt == existing().createdAt && incoming().updatedAt == request.time && isAdmin();
+      allow delete: if isVerified() && isValidId(taxonomyId) && isAdmin();
+    }
+
+    // 4. classified_issues
+    match /classified_issues/{issueId} {
+      allow get: if isVerified() && isValidId(issueId) && (
+        existing().citizenUid == request.auth.uid
+        || existing().assignedInspectorUid == request.auth.uid
+        || existing().assignedOfficerUid == request.auth.uid
+        || isAdmin()
+      );
+      allow list: if isVerified() && (
+        existing().citizenUid == request.auth.uid
+        || existing().assignedInspectorUid == request.auth.uid
+        || existing().assignedOfficerUid == request.auth.uid
+        || isBootstrappedAdmin()
+      );
+      allow create: if isVerified() && isValidId(issueId)
+        && isValidClassifiedIssue(incoming())
+        && incoming().createdAt == request.time
+        && (incoming().citizenUid == request.auth.uid || isAdmin())
+        && complaintExists(incoming().complaintId);
+      allow update: if isVerified() && isValidId(issueId)
+        && isValidClassifiedIssue(incoming())
+        && incoming().complaintId == existing().complaintId
+        && incoming().citizenUid == existing().citizenUid
+        && incoming().createdAt == existing().createdAt
+        && (isAdmin() || (isOfficer() && existing().assignedOfficerUid == request.auth.uid && incoming().diff(existing()).affectedKeys().hasOnly(['assignedInspectorUid', 'assignedOfficerUid', 'department', 'recommendedSeverity'])));
+      allow delete: if false;
+    }
+
+    // 5. ai_analysis
+    match /ai_analysis/{analysisId} {
+      allow get: if isVerified() && isValidId(analysisId) && (
+        existing().citizenUid == request.auth.uid
+        || existing().assignedInspectorUid == request.auth.uid
+        || existing().assignedOfficerUid == request.auth.uid
+        || isAdmin()
+      );
+      allow list: if isVerified() && (
+        existing().citizenUid == request.auth.uid
+        || existing().assignedInspectorUid == request.auth.uid
+        || existing().assignedOfficerUid == request.auth.uid
+        || isBootstrappedAdmin()
+      );
+      allow create: if isVerified() && isValidId(analysisId)
+        && isValidAiAnalysis(incoming())
+        && incoming().createdAt == request.time
+        && (incoming().citizenUid == request.auth.uid || isAdmin())
+        && complaintExists(incoming().complaintId);
+      allow update: if isVerified() && isValidId(analysisId)
+        && isValidAiAnalysis(incoming())
+        && incoming().complaintId == existing().complaintId
+        && incoming().citizenUid == existing().citizenUid
+        && incoming().createdAt == existing().createdAt
+        && isAdmin()
+        && incoming().diff(existing()).affectedKeys().hasOnly(['assignedInspectorUid', 'assignedOfficerUid']);
+      allow delete: if false;
+    }
+
+    // 6. evidence (ImageGuard)
+    match /evidence/{evidenceId} {
+      allow get: if isVerified() && isValidId(evidenceId) && (
+        existing().citizenUid == request.auth.uid
+        || existing().assignedInspectorUid == request.auth.uid
+        || existing().assignedOfficerUid == request.auth.uid
+        || isAdmin()
+      );
+      allow list: if isVerified() && (
+        existing().citizenUid == request.auth.uid
+        || existing().assignedInspectorUid == request.auth.uid
+        || existing().assignedOfficerUid == request.auth.uid
+        || isBootstrappedAdmin()
+      );
+      allow create: if isVerified() && isValidId(evidenceId)
+        && isValidEvidence(incoming())
+        && incoming().citizenUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && complaintExists(incoming().complaintId);
+      allow update: if isVerified() && isValidId(evidenceId)
+        && isValidEvidence(incoming())
+        && incoming().complaintId == existing().complaintId
+        && incoming().citizenUid == existing().citizenUid
+        && incoming().sha256 == existing().sha256
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin()
+          || ((isInspector() && existing().assignedInspectorUid == request.auth.uid)
+              || (isOfficer() && existing().assignedOfficerUid == request.auth.uid))
+            && incoming().diff(existing()).affectedKeys().hasOnly(['reviewStatus', 'suspiciousFlag', 'updatedAt'])
+        );
+      allow delete: if false;
+    }
+
+    // 7. accident_hotspots (Reference Data)
+    match /accident_hotspots/{hotspotId} {
+      allow get: if isVerified() && isValidId(hotspotId) && existing().recordScope == 'municipal_reference';
+      allow list: if isVerified() && existing().recordScope == 'municipal_reference';
+      allow create: if isVerified() && isValidId(hotspotId) && isValidAccidentHotspot(incoming()) && incoming().createdAt == request.time && incoming().updatedAt == request.time && isAdmin();
+      allow update: if isVerified() && isValidId(hotspotId) && isValidAccidentHotspot(incoming()) && incoming().createdAt == existing().createdAt && incoming().updatedAt == request.time && isAdmin();
+      allow delete: if isVerified() && isValidId(hotspotId) && isAdmin();
+    }
+
+    // 8. municipal_offices (Reference Data)
+    match /municipal_offices/{officeId} {
+      allow get: if isVerified() && isValidId(officeId) && existing().recordScope == 'municipal_reference';
+      allow list: if isVerified() && existing().recordScope == 'municipal_reference';
+      allow create: if isVerified() && isValidId(officeId) && isValidMunicipalOffice(incoming()) && incoming().createdAt == request.time && incoming().updatedAt == request.time && isAdmin();
+      allow update: if isVerified() && isValidId(officeId) && isValidMunicipalOffice(incoming()) && incoming().createdAt == existing().createdAt && incoming().updatedAt == request.time && isAdmin();
+      allow delete: if isVerified() && isValidId(officeId) && isAdmin();
+    }
+
+    // 9. inspector_assignments
+    match /inspector_assignments/{assignmentId} {
+      allow get: if isVerified() && isValidId(assignmentId) && (
+        existing().citizenUid == request.auth.uid
+        || existing().inspectorUid == request.auth.uid
+        || existing().assignedOfficerUid == request.auth.uid
+        || isAdmin()
+      );
+      allow list: if isVerified() && (
+        existing().citizenUid == request.auth.uid
+        || existing().inspectorUid == request.auth.uid
+        || existing().assignedOfficerUid == request.auth.uid
+        || isBootstrappedAdmin()
+      );
+      allow create: if isVerified() && isValidId(assignmentId)
+        && isValidInspectorAssignment(incoming())
+        && incoming().assignedByUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && (incoming().citizenUid == request.auth.uid || isOfficer() || isAdmin())
+        && complaintExists(incoming().complaintId);
+      allow update: if isVerified() && isValidId(assignmentId)
+        && isValidInspectorAssignment(incoming())
+        && incoming().complaintId == existing().complaintId
+        && incoming().citizenUid == existing().citizenUid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin()
+          || (existing().status != 'completed' && isInspector() && existing().inspectorUid == request.auth.uid
+              && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt']))
+          || (isOfficer() && existing().assignedOfficerUid == request.auth.uid
+              && incoming().diff(existing()).affectedKeys().hasOnly(['inspectorUid', 'inspectorName', 'priority', 'status', 'dueAt', 'updatedAt']))
+        );
+      allow delete: if false;
+    }
+
+    // 10. inspection_reports (MFIR)
+    match /inspection_reports/{reportId} {
+      allow get: if isVerified() && isValidId(reportId) && (
+        existing().citizenUid == request.auth.uid
+        || existing().inspectorUid == request.auth.uid
+        || existing().assignedOfficerUid == request.auth.uid
+        || isAdmin()
+      );
+      allow list: if isVerified() && (
+        existing().citizenUid == request.auth.uid
+        || existing().inspectorUid == request.auth.uid
+        || existing().assignedOfficerUid == request.auth.uid
+        || isBootstrappedAdmin()
+      );
+      allow create: if isVerified() && isValidId(reportId)
+        && isValidInspectionReport(incoming())
+        && incoming().inspectorUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && (isInspector() || isAdmin())
+        && complaintExists(incoming().complaintId);
+      allow update: if isVerified() && isValidId(reportId)
+        && isValidInspectionReport(incoming())
+        && incoming().complaintId == existing().complaintId
+        && incoming().inspectorUid == existing().inspectorUid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin()
+          || (existing().status != 'approved' && isOfficer() && existing().assignedOfficerUid == request.auth.uid
+              && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt']))
+          || (existing().status == 'revision_requested' && isInspector() && existing().inspectorUid == request.auth.uid
+              && incoming().diff(existing()).affectedKeys().hasOnly(['physicalVerification', 'siteNotes', 'evidenceReviewOutcome', 'finalPriority', 'recommendedDepartment', 'estimatedCostInr', 'requiresWorkOrder', 'status', 'updatedAt']))
+        );
+      allow delete: if false;
+    }
+
+    // 11. emergency_incidents
+    match /emergency_incidents/{incidentId} {
+      allow get: if isVerified() && isValidId(incidentId) && (
+        existing().citizenUid == request.auth.uid
+        || existing().assignedOfficerUid == request.auth.uid
+        || existing().backupOfficerUid == request.auth.uid
+        || existing().assignedInspectorUid == request.auth.uid
+        || isAdmin()
+      );
+      allow list: if isVerified() && (
+        existing().citizenUid == request.auth.uid
+        || existing().assignedOfficerUid == request.auth.uid
+        || existing().backupOfficerUid == request.auth.uid
+        || existing().assignedInspectorUid == request.auth.uid
+        || isBootstrappedAdmin()
+      );
+      allow create: if isVerified() && isValidId(incidentId)
+        && isValidEmergencyIncident(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && (incoming().citizenUid == request.auth.uid || isOfficer() || isAdmin())
+        && complaintExists(incoming().complaintId);
+      allow update: if isVerified() && isValidId(incidentId)
+        && isValidEmergencyIncident(incoming())
+        && incoming().complaintId == existing().complaintId
+        && incoming().citizenUid == existing().citizenUid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin()
+          || (existing().status != 'resolved'
+              && isOfficer()
+              && (existing().assignedOfficerUid == request.auth.uid || existing().backupOfficerUid == request.auth.uid)
+              && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'acknowledgedAt', 'acknowledgedByUid', 'escalatedAt', 'updatedAt']))
+        );
+      allow delete: if false;
+    }
+
+    // 12. officer_approvals
+    match /officer_approvals/{approvalId} {
+      allow get: if isVerified() && isValidId(approvalId) && (
+        existing().citizenUid == request.auth.uid
+        || existing().officerUid == request.auth.uid
+        || existing().assignedInspectorUid == request.auth.uid
+        || isAdmin()
+      );
+      allow list: if isVerified() && (
+        existing().citizenUid == request.auth.uid
+        || existing().officerUid == request.auth.uid
+        || existing().assignedInspectorUid == request.auth.uid
+        || isBootstrappedAdmin()
+      );
+      allow create: if isVerified() && isValidId(approvalId)
+        && isValidOfficerApproval(incoming())
+        && incoming().officerUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && (isOfficer() || isAdmin())
+        && complaintExists(incoming().complaintId);
+      allow update, delete: if false;
+    }
+
+    // 13. department_work_orders
+    match /department_work_orders/{workOrderId} {
+      allow get: if isVerified() && isValidId(workOrderId) && (
+        existing().citizenUid == request.auth.uid
+        || existing().officerUid == request.auth.uid
+        || existing().assignedInspectorUid == request.auth.uid
+        || isAdmin()
+      );
+      allow list: if isVerified() && (
+        existing().citizenUid == request.auth.uid
+        || existing().officerUid == request.auth.uid
+        || existing().assignedInspectorUid == request.auth.uid
+        || isBootstrappedAdmin()
+      );
+      allow create: if isVerified() && isValidId(workOrderId)
+        && isValidWorkOrder(incoming())
+        && incoming().officerUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && (isOfficer() || isAdmin())
+        && complaintExists(incoming().complaintId);
+      allow update: if isVerified() && isValidId(workOrderId)
+        && isValidWorkOrder(incoming())
+        && incoming().complaintId == existing().complaintId
+        && incoming().officerUid == existing().officerUid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin()
+          || (existing().status != 'verified' && isOfficer() && existing().officerUid == request.auth.uid
+              && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'contractorOrCrew', 'scopeOfWork', 'targetDate', 'updatedAt']))
+        );
+      allow delete: if false;
+    }
+
+    // 14. resolution_records
+    match /resolution_records/{resolutionId} {
+      allow get: if isVerified() && isValidId(resolutionId) && (
+        existing().citizenUid == request.auth.uid
+        || existing().verifiedByOfficerUid == request.auth.uid
+        || existing().assignedInspectorUid == request.auth.uid
+        || isAdmin()
+      );
+      allow list: if isVerified() && (
+        existing().citizenUid == request.auth.uid
+        || existing().verifiedByOfficerUid == request.auth.uid
+        || existing().assignedInspectorUid == request.auth.uid
+        || isBootstrappedAdmin()
+      );
+      allow create: if isVerified() && isValidId(resolutionId)
+        && isValidResolutionRecord(incoming())
+        && incoming().verifiedByOfficerUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && (isOfficer() || isAdmin())
+        && complaintExists(incoming().complaintId);
+      allow update, delete: if false;
+    }
+
+    // 15. notifications
+    match /notifications/{notificationId} {
+      allow get: if isVerified() && isValidId(notificationId) && (
+        existing().recipientUid == request.auth.uid
+        || existing().senderUid == request.auth.uid
+        || isAdmin()
+      );
+      allow list: if isVerified() && (
+        existing().recipientUid == request.auth.uid
+        || isBootstrappedAdmin()
+      );
+      allow create: if isVerified() && isValidId(notificationId)
+        && isValidNotification(incoming())
+        && incoming().senderUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && (incoming().complaintId == '' || complaintExists(incoming().complaintId));
+      allow update: if isVerified() && isValidId(notificationId)
+        && isValidNotification(incoming())
+        && incoming().recipientUid == existing().recipientUid
+        && incoming().senderUid == existing().senderUid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin()
+          || (existing().recipientUid == request.auth.uid
+              && incoming().diff(existing()).affectedKeys().hasOnly(['read', 'acknowledgedAt', 'updatedAt']))
+        );
+      allow delete: if false;
+    }
+
+    // 16. audit_logs (Strictly Immutable Append-Only)
+    match /audit_logs/{logId} {
+      allow get: if isVerified() && isValidId(logId) && (existing().actorUid == request.auth.uid || isAdmin());
+      allow list: if isVerified() && (existing().actorUid == request.auth.uid || isBootstrappedAdmin());
+      allow create: if isVerified() && isValidId(logId)
+        && isValidAuditLog(incoming())
+        && incoming().actorUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && (
+          incoming().actorRole == 'citizen'
+          || (incoming().actorRole == 'inspector' && isInspector())
+          || (incoming().actorRole == 'officer' && isOfficer())
+          || (incoming().actorRole == 'admin' && isAdmin())
+        );
+      allow update, delete: if false;
+    }
+
+    // 17. emergency_rules (Admin-managed Deterministic EmergencyGuard Rules)
+    match /emergency_rules/{ruleId} {
+      allow get: if isVerified() && isValidId(ruleId) && existing().recordScope == 'municipal_reference';
+      allow list: if isVerified() && existing().recordScope == 'municipal_reference';
+      allow create: if isVerified() && isValidId(ruleId) && isValidEmergencyRule(incoming()) && incoming().createdAt == request.time && incoming().updatedAt == request.time && isAdmin();
+      allow update: if isVerified() && isValidId(ruleId) && isValidEmergencyRule(incoming()) && incoming().createdAt == existing().createdAt && incoming().updatedAt == request.time && isAdmin();
+      allow delete: if isVerified() && isValidId(ruleId) && isAdmin();
+    }
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "CivicAI Municipal Management Platform",
+  "description": "AI-powered municipal governance platform with Gemini multimodal complaint inspection, ImageGuard evidence verification, TwinTrust OpenStreetMap jurisdiction routing, EmergencyGuard critical escalation, and role-based Citizen, Inspector, Officer, and Admin portals.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
