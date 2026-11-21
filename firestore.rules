@@ -16,7 +16,20 @@ service cloud.firestore {
     }
 
     function isBootstrappedAdmin() {
-      return isVerified() && request.auth.token.email == 'vishalkebaba@gmail.com';
+      return isVerified() && request.auth.token.email is string && request.auth.token.email.lower() == 'vishalkebaba@gmail.com';
+    }
+
+    function emailToDocId(email) {
+      return email.lower().replace('[^a-z0-9]', '_');
+    }
+
+    function hasActiveRoleAuthorization(targetRole) {
+      return isVerified()
+        && request.auth.token.email is string
+        && exists(/databases/$(database)/documents/role_authorizations/$(emailToDocId(request.auth.token.email)))
+        && get(/databases/$(database)/documents/role_authorizations/$(emailToDocId(request.auth.token.email))).data.active == true
+        && get(/databases/$(database)/documents/role_authorizations/$(emailToDocId(request.auth.token.email))).data.email.lower() == request.auth.token.email.lower()
+        && get(/databases/$(database)/documents/role_authorizations/$(emailToDocId(request.auth.token.email))).data.role == targetRole;
     }
 
     function isValidId(id) {
@@ -421,9 +434,23 @@ service cloud.firestore {
         && data.updatedAt is timestamp;
     }
 
+    function isValidRoleAuthorization(data) {
+      return data.keys().hasAll(['email', 'role', 'department', 'wardId', 'authorizedByUid', 'notes', 'active', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['email', 'role', 'department', 'wardId', 'authorizedByUid', 'notes', 'active', 'createdAt', 'updatedAt'])
+        && isStringBounded(data.email, 3, 200)
+        && data.role in ['inspector', 'officer', 'admin']
+        && isStringBounded(data.department, 0, 100)
+        && isStringBounded(data.wardId, 0, 64)
+        && isValidId(data.authorizedByUid)
+        && isStringBounded(data.notes, 0, 300)
+        && data.active is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
     // ── Collection Rules ────────────────────────────────────────────────────
 
-    // 1. users (PII Isolation + Strict Role Immutability)
+    // 1. users (PII Isolation + Strict Role Immutability — Citizens can NEVER self-escalate)
     match /users/{userId} {
       allow get: if isVerified() && isValidId(userId) && (request.auth.uid == userId || isAdmin());
       allow list: if isBootstrappedAdmin();
@@ -434,7 +461,11 @@ service cloud.firestore {
         && incoming().email == request.auth.token.email
         && incoming().createdAt == request.time
         && incoming().updatedAt == request.time
-        && (incoming().role == 'citizen' || (isBootstrappedAdmin() && incoming().role == 'admin'));
+        && (
+          incoming().role == 'citizen'
+          || (isBootstrappedAdmin() && incoming().role == 'admin')
+          || hasActiveRoleAuthorization(incoming().role)
+        );
       allow update: if isVerified() && isValidId(userId)
         && isValidUser(incoming())
         && incoming().uid == existing().uid
@@ -445,6 +476,13 @@ service cloud.firestore {
             && incoming().role == existing().role
             && incoming().email == existing().email
             && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'language', 'phone', 'onDuty', 'updatedAt']))
+          || (request.auth.uid == userId
+            && incoming().email == existing().email
+            && (
+              (isBootstrappedAdmin() && incoming().role == 'admin')
+              || hasActiveRoleAuthorization(incoming().role)
+            )
+            && incoming().diff(existing()).affectedKeys().hasOnly(['role', 'department', 'wardId', 'onDuty', 'language', 'updatedAt']))
           || (isAdmin()
             && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'role', 'language', 'department', 'wardId', 'phone', 'onDuty', 'updatedAt']))
         );
@@ -861,6 +899,30 @@ service cloud.firestore {
       allow create: if isVerified() && isValidId(ruleId) && isValidEmergencyRule(incoming()) && incoming().createdAt == request.time && incoming().updatedAt == request.time && isAdmin();
       allow update: if isVerified() && isValidId(ruleId) && isValidEmergencyRule(incoming()) && incoming().createdAt == existing().createdAt && incoming().updatedAt == request.time && isAdmin();
       allow delete: if isVerified() && isValidId(ruleId) && isAdmin();
+    }
+
+    // 18. role_authorizations (Admin-managed Staff Email Pre-Authorizations)
+    match /role_authorizations/{emailKey} {
+      allow get: if isVerified() && isValidId(emailKey) && (
+        isAdmin()
+        || (request.auth.token.email is string && emailKey == emailToDocId(request.auth.token.email))
+      );
+      allow list: if isBootstrappedAdmin();
+      allow create: if isVerified() && isValidId(emailKey)
+        && isAdmin()
+        && isValidRoleAuthorization(incoming())
+        && emailKey == emailToDocId(incoming().email)
+        && incoming().authorizedByUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isVerified() && isValidId(emailKey)
+        && isAdmin()
+        && isValidRoleAuthorization(incoming())
+        && emailKey == emailToDocId(incoming().email)
+        && incoming().email == existing().email
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time;
+      allow delete: if isVerified() && isValidId(emailKey) && isAdmin();
     }
   }
 }

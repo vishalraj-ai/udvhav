@@ -1,4 +1,4 @@
-import express, { Request, Response, NextFunction } from 'express';
+import express, { type Request, type Response, type NextFunction } from 'express';
 import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
@@ -8,12 +8,15 @@ import dotenv from 'dotenv';
 import { z } from 'zod';
 import { GoogleGenAI, Type } from '@google/genai';
 import { initializeApp as initializeAdminApp, getApps as getAdminApps, getApp as getAdminApp } from 'firebase-admin/app';
-import { getAuth as getAdminAuth, DecodedIdToken } from 'firebase-admin/auth';
+import { getAuth as getAdminAuth, type DecodedIdToken } from 'firebase-admin/auth';
 
 dotenv.config();
 
 const PORT = Number(process.env.PORT || 3000);
-const IS_PROD = process.env.NODE_ENV === 'production';
+const DIST_DIR = path.resolve(process.cwd(), 'dist');
+const IS_PROD =
+  process.env.NODE_ENV === 'production' ||
+  (process.env.npm_lifecycle_event === 'start' && fs.existsSync(path.join(DIST_DIR, 'index.html')));
 
 // Load Firebase project ID strictly from provisioned firebase-applet-config.json
 const firebaseConfigPath = path.resolve(process.cwd(), 'firebase-applet-config.json');
@@ -36,6 +39,22 @@ if (firebaseProjectId) {
   } else {
     getAdminApp();
   }
+}
+
+// Server-side configured initial Administrator Gmail list (normalized lowercase)
+const DEFAULT_BOOTSTRAP_ADMIN_EMAIL = 'vishalkebaba@gmail.com';
+function getConfiguredAdminEmails(): { emails: string[]; configuredViaEnv: boolean } {
+  const raw = (process.env.ADMIN_BOOTSTRAP_EMAIL || '').trim();
+  if (raw) {
+    const parsed = raw
+      .split(',')
+      .map((e) => e.trim().toLowerCase())
+      .filter((e) => e.includes('@') && e.length >= 5);
+    if (parsed.length > 0) {
+      return { emails: parsed, configuredViaEnv: true };
+    }
+  }
+  return { emails: [DEFAULT_BOOTSTRAP_ADMIN_EMAIL], configuredViaEnv: false };
 }
 
 // Shared server-side Gemini client
@@ -389,9 +408,17 @@ async function startServer() {
   // ── 1. Health & Integration Readiness Endpoint ─────────────────────────────
   app.get('/api/health', (_req: Request, res: Response) => {
     const geminiConfigured = Boolean(process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY');
+    const adminBootstrap = getConfiguredAdminEmails();
     res.json({
       status: 'ok',
       timestamp: new Date().toISOString(),
+      environment: IS_PROD ? 'production' : 'development',
+      devDemoAvailable: !IS_PROD,
+      adminBootstrap: {
+        configuredViaEnv: adminBootstrap.configuredViaEnv,
+        adminCount: adminBootstrap.emails.length,
+        adminSdkMode: 'verifyIdToken-starter-tier',
+      },
       integrations: {
         geminiAi: {
           configured: geminiConfigured,
@@ -416,7 +443,7 @@ async function startServer() {
           configured: Boolean(process.env.VITE_FCM_VAPID_KEY),
           note: process.env.VITE_FCM_VAPID_KEY
             ? 'FCM VAPID key configured alongside Firestore real-time notifications.'
-            : 'Firestore real-time in-app notifications are active. Add VITE_FCM_VAPID_KEY from Firebase Console to enable background web push.',
+            : 'Optional — web push is disabled until VITE_FCM_VAPID_KEY is configured. Firestore real-time in-app notifications are active.',
         },
         cloudTasks: {
           configured: false,
@@ -427,6 +454,36 @@ async function startServer() {
           note: 'CivicAI routes Critical incidents to authorized municipal officers and displays Call 112 guidance. Direct 112 emergency dispatch is never simulated without an official government integration.',
         },
       },
+    });
+  });
+
+  // ── 1b. Secure Server-Side Administrator Bootstrap Verification ────────────
+  // Uses Firebase Admin SDK verifyIdToken() (zero IAM required; Starter Tier compatible).
+  // Never exposes the configured admin email list to non-admin callers.
+  app.post('/api/auth/bootstrap-verify', verifyAuth, (req: AuthedRequest, res: Response) => {
+    const decoded = req.user;
+    if (!decoded || !decoded.email) {
+      res.status(401).json({ error: 'Verified Google email claim is missing from token.' });
+      return;
+    }
+
+    const normalizedEmail = decoded.email.toLowerCase();
+    const { emails, configuredViaEnv } = getConfiguredAdminEmails();
+    const isBootstrapAdmin = Boolean(decoded.email_verified && emails.includes(normalizedEmail));
+
+    console.info(
+      `[CivicAI RBAC] Bootstrap check | uid=${decoded.uid} verified=${Boolean(decoded.email_verified)} isBootstrapAdmin=${isBootstrapAdmin} envConfigured=${configuredViaEnv}`
+    );
+
+    res.json({
+      verified: true,
+      uid: decoded.uid,
+      email: decoded.email,
+      emailVerified: Boolean(decoded.email_verified),
+      isBootstrapAdmin,
+      configuredViaEnv,
+      devDemoAvailable: !IS_PROD,
+      adminSdkMode: 'verifyIdToken-starter-tier',
     });
   });
 

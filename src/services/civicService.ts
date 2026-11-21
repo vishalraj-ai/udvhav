@@ -39,6 +39,8 @@ import type {
   TwinTrustContextResponse,
   SeverityLevel,
   HealthIntegrationStatus,
+  RoleAuthorizationRecord,
+  BootstrapVerifyResponse,
 } from '../types/civic';
 import { STARTER_TAXONOMY, STARTER_EMERGENCY_RULES } from '../data/municipalDefaults';
 
@@ -70,39 +72,153 @@ export async function fetchHealthStatus(): Promise<HealthIntegrationStatus> {
   return (await resp.json()) as HealthIntegrationStatus;
 }
 
-// ── User Profile & RBAC Initialization ───────────────────────────────────────
-export async function ensureUserProfile(preferredLanguage: SupportedLanguage): Promise<UserProfile> {
+// Deterministic safe Firestore document ID for an email (must match firestore.rules emailToDocId)
+export function emailToAuthorizationId(email: string): string {
+  return email.trim().toLowerCase().replace(/[^a-z0-9]/g, '_');
+}
+
+export async function verifyServerAdminBootstrap(): Promise<BootstrapVerifyResponse> {
+  const headers = await getBearerHeaders();
+  const resp = await fetch('/api/auth/bootstrap-verify', {
+    method: 'POST',
+    headers,
+  });
+  if (!resp.ok) {
+    const body = (await resp.json().catch(() => ({}))) as { error?: string };
+    throw new Error(body.error || 'Failed to verify administrator bootstrap status with server.');
+  }
+  return (await resp.json()) as BootstrapVerifyResponse;
+}
+
+// ── User Profile & Secure RBAC Initialization ────────────────────────────────
+export async function initializeUserSession(
+  preferredLanguage: SupportedLanguage
+): Promise<{ profile: UserProfile; bootstrap: BootstrapVerifyResponse | null }> {
   const user = auth.currentUser;
   if (!user) throw new Error('Not signed in.');
   const path = `users/${user.uid}`;
+
+  // 1. Server-side Firebase Admin SDK token verification & ADMIN_BOOTSTRAP_EMAIL check
+  let bootstrap: BootstrapVerifyResponse | null = null;
+  try {
+    bootstrap = await verifyServerAdminBootstrap();
+  } catch (err) {
+    console.warn('Bootstrap verification endpoint unavailable, falling back to verified token check:', err);
+  }
+
+  const normalizedEmail = (user.email || '').trim().toLowerCase();
+  const isRuleBootstrapAdmin = Boolean(
+    user.emailVerified && normalizedEmail === BOOTSTRAPPED_ADMIN_EMAIL.toLowerCase()
+  );
+  const isVerifiedBootstrapAdmin = Boolean(
+    user.emailVerified && (bootstrap ? bootstrap.isBootstrapAdmin && isRuleBootstrapAdmin : isRuleBootstrapAdmin)
+  );
+
+  // 2. Check Admin-created email pre-authorization record (role_authorizations/{emailKey})
+  let activePreAuth: RoleAuthorizationRecord | null = null;
+  if (user.emailVerified && normalizedEmail) {
+    const authDocId = emailToAuthorizationId(normalizedEmail);
+    try {
+      const preAuthSnap = await getDoc(doc(db, 'role_authorizations', authDocId));
+      if (preAuthSnap.exists()) {
+        const candidate = { id: preAuthSnap.id, ...preAuthSnap.data() } as RoleAuthorizationRecord;
+        if (candidate.active && candidate.email.trim().toLowerCase() === normalizedEmail) {
+          activePreAuth = candidate;
+        }
+      }
+    } catch {
+      // No pre-authorization exists for this email; user remains Citizen unless bootstrapped Admin
+    }
+  }
+
   try {
     const ref = doc(db, 'users', user.uid);
     const snap = await getDoc(ref);
+
     if (snap.exists()) {
       const data = snap.data() as UserProfile;
+
+      // Promote an existing account strictly if verified as initial Bootstrap Admin
+      // or explicitly pre-authorized by an Administrator in role_authorizations
+      if (isVerifiedBootstrapAdmin && data.role !== 'admin') {
+        const nextDept = data.department || 'Municipal Administration';
+        await updateDoc(ref, {
+          role: 'admin',
+          department: nextDept,
+          onDuty: true,
+          language: preferredLanguage || data.language || 'en',
+          updatedAt: serverTimestamp(),
+        });
+        await logAudit({
+          actorUid: user.uid,
+          actorRole: 'admin',
+          action: 'ADMIN_BOOTSTRAP_ACTIVATED',
+          entityType: 'users',
+          entityId: user.uid,
+          summary: `Verified initial Administrator ${data.email} promoted from ${data.role} to admin via server bootstrap.`,
+        });
+        const refreshed = await getDoc(ref);
+        return { profile: refreshed.data() as UserProfile, bootstrap };
+      }
+
+      if (activePreAuth && data.role !== activePreAuth.role) {
+        await updateDoc(ref, {
+          role: activePreAuth.role,
+          department: activePreAuth.department || data.department || '',
+          wardId: activePreAuth.wardId || data.wardId || '',
+          onDuty: true,
+          language: preferredLanguage || data.language || 'en',
+          updatedAt: serverTimestamp(),
+        });
+        await logAudit({
+          actorUid: user.uid,
+          actorRole: activePreAuth.role,
+          action: 'STAFF_PREAUTH_ACTIVATED',
+          entityType: 'users',
+          entityId: user.uid,
+          summary: `Pre-authorized account ${data.email} activated with role=${activePreAuth.role}.`,
+        });
+        const refreshed = await getDoc(ref);
+        return { profile: refreshed.data() as UserProfile, bootstrap };
+      }
+
       if (preferredLanguage && data.language !== preferredLanguage) {
         await updateDoc(ref, {
           language: preferredLanguage,
           updatedAt: serverTimestamp(),
         });
-        return { ...data, language: preferredLanguage };
+        return { profile: { ...data, language: preferredLanguage }, bootstrap };
       }
-      return data;
+      return { profile: data, bootstrap };
     }
 
-    const isBootstrapAdmin =
-      user.emailVerified && user.email?.toLowerCase() === BOOTSTRAPPED_ADMIN_EMAIL.toLowerCase();
+    // New user creation: default strictly to 'citizen' unless verified Bootstrap Admin or Admin pre-authorized
+    let initialRole: UserRole = 'citizen';
+    let initialDepartment = '';
+    let initialWardId = '';
+    let initialOnDuty = false;
+
+    if (isVerifiedBootstrapAdmin) {
+      initialRole = 'admin';
+      initialDepartment = 'Municipal Administration';
+      initialOnDuty = true;
+    } else if (activePreAuth) {
+      initialRole = activePreAuth.role;
+      initialDepartment = activePreAuth.department || '';
+      initialWardId = activePreAuth.wardId || '';
+      initialOnDuty = true;
+    }
 
     const newProfile = {
       uid: user.uid,
       displayName: (user.displayName || user.email?.split('@')[0] || 'Civic User').slice(0, 120),
       email: (user.email || '').slice(0, 200),
-      role: (isBootstrapAdmin ? 'admin' : 'citizen') as UserRole,
+      role: initialRole,
       language: preferredLanguage || 'en',
-      department: isBootstrapAdmin ? 'Municipal Administration' : '',
-      wardId: '',
+      department: initialDepartment,
+      wardId: initialWardId,
       phone: '',
-      onDuty: isBootstrapAdmin,
+      onDuty: initialOnDuty,
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
     };
@@ -111,17 +227,22 @@ export async function ensureUserProfile(preferredLanguage: SupportedLanguage): P
     await logAudit({
       actorUid: user.uid,
       actorRole: newProfile.role,
-      action: 'USER_REGISTERED',
+      action: isVerifiedBootstrapAdmin ? 'ADMIN_BOOTSTRAP_REGISTERED' : 'USER_REGISTERED',
       entityType: 'users',
       entityId: user.uid,
       summary: `User ${newProfile.displayName} registered with role ${newProfile.role}.`,
     });
 
     const created = await getDoc(ref);
-    return created.data() as UserProfile;
+    return { profile: created.data() as UserProfile, bootstrap };
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, path);
   }
+}
+
+export async function ensureUserProfile(preferredLanguage: SupportedLanguage): Promise<UserProfile> {
+  const { profile } = await initializeUserSession(preferredLanguage);
+  return profile;
 }
 
 export async function updateOwnProfile(
@@ -174,6 +295,106 @@ export async function adminUpdateUser(
     });
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, path);
+  }
+}
+
+export async function authorizeStaffAccountByEmail(
+  params: {
+    email: string;
+    role: 'inspector' | 'officer' | 'admin';
+    department: string;
+    wardId: string;
+    notes: string;
+  },
+  adminUid: string,
+  existingUsers: UserProfile[]
+): Promise<{ updatedExistingUser: boolean }> {
+  const cleanEmail = params.email.trim().toLowerCase();
+  if (!cleanEmail || !cleanEmail.includes('@') || cleanEmail.length < 5) {
+    throw new Error('Enter a valid Google account email address.');
+  }
+  const emailKey = emailToAuthorizationId(cleanEmail);
+  const path = `role_authorizations/${emailKey}`;
+  try {
+    const ref = doc(db, 'role_authorizations', emailKey);
+    const existingSnap = await getDoc(ref);
+    if (existingSnap.exists()) {
+      await updateDoc(ref, {
+        role: params.role,
+        department: params.department.slice(0, 100),
+        wardId: params.wardId.slice(0, 64),
+        authorizedByUid: adminUid,
+        notes: params.notes.slice(0, 300),
+        active: true,
+        updatedAt: serverTimestamp(),
+      });
+    } else {
+      await setDoc(ref, {
+        email: cleanEmail.slice(0, 200),
+        role: params.role,
+        department: params.department.slice(0, 100),
+        wardId: params.wardId.slice(0, 64),
+        authorizedByUid: adminUid,
+        notes: params.notes.slice(0, 300),
+        active: true,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    }
+
+    // If this person already signed in earlier as a Citizen, immediately upgrade their live profile
+    const matchingUser = existingUsers.find((u) => u.email.trim().toLowerCase() === cleanEmail);
+    let updatedExistingUser = false;
+    if (matchingUser) {
+      await adminUpdateUser(
+        matchingUser.uid,
+        {
+          displayName: matchingUser.displayName,
+          role: params.role,
+          language: matchingUser.language,
+          department: params.department || matchingUser.department,
+          wardId: params.wardId || matchingUser.wardId,
+          phone: matchingUser.phone,
+          onDuty: true,
+        },
+        adminUid
+      );
+      updatedExistingUser = true;
+    }
+
+    await logAudit({
+      actorUid: adminUid,
+      actorRole: 'admin',
+      action: 'STAFF_EMAIL_AUTHORIZED',
+      entityType: 'role_authorizations',
+      entityId: emailKey,
+      summary: `Authorized ${cleanEmail} for role=${params.role}, dept=${params.department || 'none'}, ward=${params.wardId || 'none'}.`,
+    });
+
+    return { updatedExistingUser };
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, path);
+  }
+}
+
+export async function revokeRoleAuthorization(
+  emailKey: string,
+  email: string,
+  adminUid: string
+): Promise<void> {
+  const path = `role_authorizations/${emailKey}`;
+  try {
+    await deleteDoc(doc(db, 'role_authorizations', emailKey));
+    await logAudit({
+      actorUid: adminUid,
+      actorRole: 'admin',
+      action: 'STAFF_EMAIL_AUTHORIZATION_REVOKED',
+      entityType: 'role_authorizations',
+      entityId: emailKey,
+      summary: `Revoked pre-authorization for ${email}.`,
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, path);
   }
 }
 
@@ -1521,6 +1742,21 @@ export function subscribeAllUsersAdmin(onData: (users: UserProfile[]) => void): 
       onData(snap.docs.map((d) => d.data() as UserProfile));
     },
     (error) => handleFirestoreError(error, OperationType.LIST, 'users')
+  );
+}
+
+export function subscribeRoleAuthorizations(
+  onData: (items: RoleAuthorizationRecord[]) => void
+): Unsubscribe {
+  const q = query(collection(db, 'role_authorizations'), limit(200));
+  return onSnapshot(
+    q,
+    (snap) => {
+      const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }) as RoleAuthorizationRecord);
+      list.sort((a, b) => (b.updatedAt?.toMillis?.() ?? 0) - (a.updatedAt?.toMillis?.() ?? 0));
+      onData(list);
+    },
+    (error) => handleFirestoreError(error, OperationType.LIST, 'role_authorizations')
   );
 }
 

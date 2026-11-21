@@ -425,6 +425,23 @@
         "updatedAt": { "type": "string", "format": "date-time" }
       },
       "required": ["ruleCode", "name", "keywords", "taxonomyCodes", "severity", "ackWindowMinutes", "active", "recordScope", "createdAt", "updatedAt"]
+    },
+    "RoleAuthorization": {
+      "title": "RoleAuthorization",
+      "description": "Administrator-managed email pre-authorization record granting Inspector, Municipal Officer, or Administrator access upon verified Google Sign-In.",
+      "type": "object",
+      "properties": {
+        "email": { "type": "string", "minLength": 3, "maxLength": 200 },
+        "role": { "type": "string", "enum": ["inspector", "officer", "admin"] },
+        "department": { "type": "string", "maxLength": 100 },
+        "wardId": { "type": "string", "maxLength": 64 },
+        "authorizedByUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "notes": { "type": "string", "maxLength": 300 },
+        "active": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["email", "role", "department", "wardId", "authorizedByUid", "notes", "active", "createdAt", "updatedAt"]
     }
   },
   "firestore": {
@@ -444,6 +461,7 @@
     "/resolution_records/{resolutionId}": { "schema": { "$ref": "#/entities/ResolutionRecord" }, "description": "Final resolution verification records" },
     "/notifications/{notificationId}": { "schema": { "$ref": "#/entities/Notification" }, "description": "Real-time user notifications" },
     "/audit_logs/{logId}": { "schema": { "$ref": "#/entities/AuditLog" }, "description": "Immutable append-only audit log" },
-    "/emergency_rules/{ruleId}": { "schema": { "$ref": "#/entities/EmergencyRule" }, "description": "Deterministic EmergencyGuard rules" }
+    "/emergency_rules/{ruleId}": { "schema": { "$ref": "#/entities/EmergencyRule" }, "description": "Deterministic EmergencyGuard rules" },
+    "/role_authorizations/{emailKey}": { "schema": { "$ref": "#/entities/RoleAuthorization" }, "description": "Admin-managed staff email role pre-authorizations" }
   }
 }

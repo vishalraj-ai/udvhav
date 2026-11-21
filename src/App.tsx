@@ -4,18 +4,21 @@ import {
   Bell,
   Building2,
   ClipboardCheck,
+  FlaskConical,
   LayoutDashboard,
   Loader2,
   LogOut,
   PhoneCall,
   ShieldAlert,
   UserCheck,
+  X,
 } from 'lucide-react';
 import { auth, BOOTSTRAPPED_ADMIN_EMAIL, googleProvider } from './firebase';
 import type {
   AccidentHotspotRecord,
   AiAnalysisRecord,
   AuditLogRecord,
+  BootstrapVerifyResponse,
   ClassifiedIssueRecord,
   ComplaintRecord,
   DepartmentWorkOrderRecord,
@@ -30,19 +33,21 @@ import type {
   NotificationRecord,
   OfficerApprovalRecord,
   ResolutionRecord,
+  RoleAuthorizationRecord,
   SupportedLanguage,
   UserProfile,
 } from './types/civic';
 import { SUPPORTED_LANGUAGES, UI_TRANSLATIONS } from './i18n/translations';
 import {
-  ensureUserProfile,
   fetchHealthStatus,
+  initializeUserSession,
   subscribeAllUsersAdmin,
   subscribeAuditLogs,
   subscribeComplaintScopedCollection,
   subscribeComplaintsForRole,
   subscribeNotifications,
   subscribeReferenceCollection,
+  subscribeRoleAuthorizations,
 } from './services/civicService';
 import { CitizenPortal } from './components/CitizenPortal';
 import { InspectorPortal } from './components/InspectorPortal';
@@ -56,11 +61,15 @@ export default function App() {
   const [firebaseUser, setFirebaseUser] = useState<User | null>(null);
   const [authReady, setAuthReady] = useState(false);
   const [profile, setProfile] = useState<UserProfile | null>(null);
+  const [bootstrapInfo, setBootstrapInfo] = useState<BootstrapVerifyResponse | null>(null);
   const [language, setLanguage] = useState<SupportedLanguage>('en');
-  const [portalView, setPortalView] = useState<PortalView>('citizen');
   const [signingIn, setSigningIn] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
+
+  // Development-only demo environment (strictly disabled in production builds & unavailable to non-admins)
+  const [devDemoActive, setDevDemoActive] = useState(false);
+  const [demoRole, setDemoRole] = useState<PortalView>('citizen');
 
   // Real-time Firestore collections state
   const [complaints, setComplaints] = useState<ComplaintRecord[]>([]);
@@ -76,6 +85,7 @@ export default function App() {
   const [notifications, setNotifications] = useState<NotificationRecord[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditLogRecord[]>([]);
   const [users, setUsers] = useState<UserProfile[]>([]);
+  const [roleAuthorizations, setRoleAuthorizations] = useState<RoleAuthorizationRecord[]>([]);
 
   // Reference data collections
   const [taxonomy, setTaxonomy] = useState<IssueTaxonomyRecord[]>([]);
@@ -91,24 +101,31 @@ export default function App() {
       firebaseUser?.email?.toLowerCase() === BOOTSTRAPPED_ADMIN_EMAIL.toLowerCase()
   );
 
+  const canUseDevDemo = Boolean(
+    import.meta.env.DEV &&
+      healthStatus?.devDemoAvailable !== false &&
+      (bootstrapInfo?.devDemoAvailable ?? true) &&
+      profile?.role === 'admin'
+  );
+
   // 1. Auth listener
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, async (user) => {
       setFirebaseUser(user);
       if (user) {
         try {
-          const loaded = await ensureUserProfile(language);
+          const { profile: loaded, bootstrap } = await initializeUserSession(language);
           setProfile(loaded);
+          setBootstrapInfo(bootstrap);
           setLanguage(loaded.language || 'en');
-          if (loaded.role === 'admin') setPortalView('admin');
-          else if (loaded.role === 'officer') setPortalView('officer');
-          else if (loaded.role === 'inspector') setPortalView('inspector');
-          else setPortalView('citizen');
+          setDevDemoActive(false);
         } catch (err) {
           setAuthError(err instanceof Error ? err.message : 'Failed to load user profile.');
         }
       } else {
         setProfile(null);
+        setBootstrapInfo(null);
+        setDevDemoActive(false);
       }
       setAuthReady(true);
     });
@@ -193,6 +210,7 @@ export default function App() {
 
     if (isBootstrappedAdmin) {
       unsubs.push(subscribeAllUsersAdmin(setUsers));
+      unsubs.push(subscribeRoleAuthorizations(setRoleAuthorizations));
     }
 
     return () => {
@@ -221,26 +239,37 @@ export default function App() {
   const handleSignOut = async () => {
     await signOut(auth);
     setProfile(null);
+    setBootstrapInfo(null);
+    setDevDemoActive(false);
     setDrawerOpen(false);
   };
 
-  // Authorized navigation tabs per RBAC role
-  const allowedPortals = useMemo((): Array<{ id: PortalView; label: string; icon: typeof Building2 }> => {
-    if (!profile) return [];
-    const items: Array<{ id: PortalView; label: string; icon: typeof Building2 }> = [
+  // Strict RBAC portal separation: in live mode, every role sees ONLY its single permitted portal.
+  // In Development Demo Mode (Admin-only, strictly disabled in production), Admin can preview & test all 4 portals
+  // while keeping their real authenticated admin identity for Firestore security rules and honest audit logging.
+  const activePortal: PortalView = useMemo(() => {
+    if (!profile) return 'citizen';
+    if (devDemoActive && canUseDevDemo) return demoRole;
+    return profile.role;
+  }, [profile, devDemoActive, canUseDevDemo, demoRole]);
+
+  const portalCatalog: Array<{ id: PortalView; label: string; icon: typeof Building2 }> = useMemo(
+    () => [
       { id: 'citizen', label: 'Citizen Portal', icon: Building2 },
-    ];
-    if (profile.role === 'inspector' || profile.role === 'admin') {
-      items.push({ id: 'inspector', label: 'Inspector Portal', icon: ClipboardCheck });
+      { id: 'inspector', label: 'Inspector Portal', icon: ClipboardCheck },
+      { id: 'officer', label: 'Officer Portal', icon: ShieldAlert },
+      { id: 'admin', label: 'Administrator', icon: LayoutDashboard },
+    ],
+    []
+  );
+
+  const allowedPortals = useMemo(() => {
+    if (!profile) return [];
+    if (devDemoActive && canUseDevDemo) {
+      return portalCatalog;
     }
-    if (profile.role === 'officer' || profile.role === 'admin') {
-      items.push({ id: 'officer', label: 'Officer Portal', icon: ShieldAlert });
-    }
-    if (profile.role === 'admin') {
-      items.push({ id: 'admin', label: 'Administrator', icon: LayoutDashboard });
-    }
-    return items;
-  }, [profile]);
+    return portalCatalog.filter((item) => item.id === profile.role);
+  }, [profile, devDemoActive, canUseDevDemo, portalCatalog]);
 
   if (!authReady) {
     return (
@@ -388,11 +417,11 @@ export default function App() {
 
   // ── Authenticated Role-Based Municipal Workspace ───────────────────────────
   const activePortalTitle =
-    portalView === 'citizen'
+    activePortal === 'citizen'
       ? 'Citizen Grievance Portal'
-      : portalView === 'inspector'
+      : activePortal === 'inspector'
       ? 'Field Inspector Portal & MFIR'
-      : portalView === 'officer'
+      : activePortal === 'officer'
       ? 'Municipal Officer Operations'
       : 'Platform Administration & Governance';
 
@@ -406,14 +435,21 @@ export default function App() {
         </div>
 
         <nav className="flex-1 p-3 space-y-1">
+          <div className="px-3 pb-1 text-[11px] font-medium text-slate-400">
+            {devDemoActive && canUseDevDemo ? 'Dev Demo Role Switcher' : 'Authorized Portal'}
+          </div>
           {allowedPortals.map((item) => {
             const Icon = item.icon;
-            const active = portalView === item.id;
+            const active = activePortal === item.id;
             return (
               <button
                 key={item.id}
                 type="button"
-                onClick={() => setPortalView(item.id)}
+                onClick={() => {
+                  if (devDemoActive && canUseDevDemo) {
+                    setDemoRole(item.id);
+                  }
+                }}
                 className={`w-full flex items-center justify-between gap-2 px-3 py-2.5 rounded-md text-sm font-medium transition-colors ${
                   active ? 'bg-slate-800 text-white' : 'text-slate-300 hover:bg-slate-800/60 hover:text-white'
                 }`}
@@ -430,13 +466,47 @@ export default function App() {
               </button>
             );
           })}
+
+          {/* Development-Only Demo Environment Toggle (Visible ONLY to verified Admins in dev mode) */}
+          {canUseDevDemo && (
+            <div className="pt-4 mt-4 border-t border-slate-800 space-y-2">
+              <div className="px-3 text-[11px] font-medium text-amber-300 flex items-center gap-1.5">
+                <FlaskConical className="w-3.5 h-3.5 shrink-0" />
+                Development Demo Mode
+              </div>
+              <p className="px-3 text-[11px] text-slate-400 leading-relaxed">
+                Test all four portals locally without relaxing production RBAC. Disabled automatically in production.
+              </p>
+              <div className="px-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (devDemoActive) {
+                      setDevDemoActive(false);
+                      setDemoRole('admin');
+                    } else {
+                      setDemoRole('citizen');
+                      setDevDemoActive(true);
+                    }
+                  }}
+                  className={`w-full px-3 py-2 rounded-md text-xs font-medium transition-colors ${
+                    devDemoActive
+                      ? 'bg-amber-500/20 text-amber-200 hover:bg-amber-500/30 border border-amber-400/40'
+                      : 'bg-slate-800 text-slate-200 hover:bg-slate-700 border border-slate-700'
+                  }`}
+                >
+                  {devDemoActive ? 'Exit Development Demo Mode' : 'Launch 4-Role Dev Demo'}
+                </button>
+              </div>
+            </div>
+          )}
         </nav>
 
         <div className="p-4 border-t border-slate-800 space-y-2 text-xs">
           <div className="font-medium text-white truncate">{profile.displayName}</div>
           <div className="text-slate-400 truncate">{profile.email}</div>
           <div className="text-slate-400">
-            Role: <span className="text-slate-200 capitalize">{profile.role}</span>
+            Live Role: <span className="text-slate-200 capitalize">{profile.role}</span>
             {profile.department ? ` · ${profile.department}` : ''}
           </div>
           <button
@@ -451,10 +521,54 @@ export default function App() {
 
       {/* Main Content Shell */}
       <div className="flex-1 flex flex-col min-w-0">
+        {/* Clearly Labelled Development Demo Environment Banner */}
+        {devDemoActive && canUseDevDemo && (
+          <div className="bg-amber-50 border-b border-amber-300 px-6 py-2.5 flex flex-wrap items-center justify-between gap-3 text-xs">
+            <div className="flex items-center gap-2 text-amber-950">
+              <FlaskConical className="w-4 h-4 text-amber-700 shrink-0" />
+              <div>
+                <span className="font-semibold">DEVELOPMENT DEMO ENVIRONMENT</span>
+                <span className="text-amber-800 ml-2">
+                  Previewing <strong className="capitalize">{demoRole}</strong> portal using your Administrator session. Production RBAC &amp; Firestore rules remain strictly enforced.
+                </span>
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center gap-1.5">
+              {portalCatalog.map((item) => (
+                <button
+                  key={item.id}
+                  type="button"
+                  onClick={() => setDemoRole(item.id)}
+                  className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${
+                    demoRole === item.id
+                      ? 'bg-amber-900 text-white'
+                      : 'bg-white text-amber-900 border border-amber-300 hover:bg-amber-100'
+                  }`}
+                >
+                  {item.label}
+                </button>
+              ))}
+              <button
+                type="button"
+                onClick={() => {
+                  setDevDemoActive(false);
+                  setDemoRole('admin');
+                }}
+                className="inline-flex items-center gap-1 px-2.5 py-1 rounded text-xs font-medium text-slate-700 bg-white border border-slate-300 hover:bg-slate-100 ml-1"
+              >
+                <X className="w-3.5 h-3.5" /> Exit Demo
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Top Workspace Header (Breadcrumb + Notification Action) */}
         <header className="bg-white border-b border-slate-200 px-6 py-3.5 flex items-center justify-between gap-4 sticky top-0 z-30">
           <div className="min-w-0">
-            <div className="text-xs text-slate-500">CivicAI / {profile.role.toUpperCase()}</div>
+            <div className="text-xs text-slate-500">
+              CivicAI / {activePortal.toUpperCase()}
+              {devDemoActive && canUseDevDemo ? ' (DEV DEMO)' : ''}
+            </div>
             <h1 className="text-base font-semibold text-slate-900 truncate">{activePortalTitle}</h1>
           </div>
 
@@ -472,7 +586,7 @@ export default function App() {
         </header>
 
         <main className="flex-1 p-6 lg:p-8 max-w-[1440px] w-full mx-auto">
-          {portalView === 'citizen' && (
+          {activePortal === 'citizen' && (profile.role === 'citizen' || (devDemoActive && canUseDevDemo)) && (
             <CitizenPortal
               profile={profile}
               language={language}
@@ -491,7 +605,7 @@ export default function App() {
             />
           )}
 
-          {portalView === 'inspector' && (profile.role === 'inspector' || profile.role === 'admin') && (
+          {activePortal === 'inspector' && (profile.role === 'inspector' || (devDemoActive && canUseDevDemo)) && (
             <InspectorPortal
               profile={profile}
               complaints={complaints}
@@ -505,7 +619,7 @@ export default function App() {
             />
           )}
 
-          {portalView === 'officer' && (profile.role === 'officer' || profile.role === 'admin') && (
+          {activePortal === 'officer' && (profile.role === 'officer' || (devDemoActive && canUseDevDemo)) && (
             <OfficerPortal
               profile={profile}
               complaints={complaints}
@@ -517,10 +631,12 @@ export default function App() {
             />
           )}
 
-          {portalView === 'admin' && profile.role === 'admin' && (
+          {activePortal === 'admin' && profile.role === 'admin' && (
             <AdminDashboard
               profile={profile}
               users={users}
+              roleAuthorizations={roleAuthorizations}
+              bootstrapInfo={bootstrapInfo}
               complaints={complaints}
               offices={offices}
               hotspots={hotspots}

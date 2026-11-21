@@ -394,9 +394,40 @@ export interface TwinTrustContextResponse {
   infrastructureNote: string;
 }
 
+export interface RoleAuthorizationRecord {
+  id: string;
+  email: string;
+  role: 'inspector' | 'officer' | 'admin';
+  department: string;
+  wardId: string;
+  authorizedByUid: string;
+  notes: string;
+  active: boolean;
+  createdAt?: Timestamp | null;
+  updatedAt?: Timestamp | null;
+}
+
+export interface BootstrapVerifyResponse {
+  verified: boolean;
+  uid: string;
+  email: string;
+  emailVerified: boolean;
+  isBootstrapAdmin: boolean;
+  configuredViaEnv: boolean;
+  devDemoAvailable: boolean;
+  adminSdkMode: string;
+}
+
 export interface HealthIntegrationStatus {
   status: string;
   timestamp: string;
+  environment?: 'production' | 'development';
+  devDemoAvailable?: boolean;
+  adminBootstrap?: {
+    configuredViaEnv: boolean;
+    adminCount: number;
+    adminSdkMode: string;
+  };
   integrations: {
     geminiAi: { configured: boolean; model: string; mode: string };
     firebaseAuthAndFirestore: { configured: boolean; projectId: string | null; mode: string };
